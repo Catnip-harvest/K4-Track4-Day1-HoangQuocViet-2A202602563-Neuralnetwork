@@ -7,3 +7,5 @@ data/processed/
 *.pt
 *.pth
 *.ckpt
+.venv/
+submission_*/eval_extra/predictions_eval_*.csv
