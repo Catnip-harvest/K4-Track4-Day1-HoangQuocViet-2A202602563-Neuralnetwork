@@ -145,8 +145,9 @@ def run_experiment(cfg: dict, data: dict, verbose: bool = True) -> dict:
     - best_epoch = epoch có val_loss thấp nhất; val_acc/val_macro_f1 của summary lấy tại epoch đó;
       best_state = bản sao state_dict tại epoch đó (giữ trong bộ nhớ để dự đoán eval ở Part 4).
     - diverged: loss NaN/inf -> dừng ngay, giữ lịch sử đến epoch hoàn chỉnh cuối cùng.
-    - peak_mem_MB: bộ nhớ GPU cực đại VƯỢT TRÊN phần đã chiếm sẵn khi bắt đầu (dữ liệu ~125 MB nằm sẵn
-      trên GPU cho mọi lần chạy). Tức là bộ nhớ của model + optimizer + kích hoạt + gradient.
+    - peak_mem_MB: bộ nhớ GPU cực đại TRONG CÁC VÒNG HUẤN LUYỆN, trừ phần dữ liệu đã nằm sẵn trên GPU
+      (~125 MB, như nhau cho mọi lần chạy): tức model + trạng thái optimizer + kích hoạt + gradient (+ bản
+      sao FP16/BF16 khi autocast). Không tính lượt đánh giá FP32 (lô 8192) để so sánh AMP có nghĩa.
     TUYỆT ĐỐI không dùng X_eval trong hàm này: chọn epoch chỉ bằng val.
     """
     cfg = _fill_cfg(cfg)
@@ -155,6 +156,13 @@ def run_experiment(cfg: dict, data: dict, verbose: bool = True) -> dict:
     on_cuda = device.type == "cuda"
 
     set_seed(cfg["seed"])
+    sub_idx = torch.randperm(len(X_tr), generator=torch.Generator().manual_seed(0))[:TRAIN_LOSS_SUBSET]
+    X_sub, y_sub = X_tr[sub_idx.to(device)], y_tr[sub_idx.to(device)]
+    if on_cuda:
+        torch.cuda.synchronize()
+        mem_start = torch.cuda.memory_allocated()     # chỉ dữ liệu đã nằm sẵn trên GPU
+    train_peak = 0
+
     model = build_model(cfg, device)
     opt = build_optimizer(cfg["optimizer"], model.parameters(), lr=cfg["lr"],
                           weight_decay=cfg["weight_decay"], momentum=cfg["momentum"],
@@ -167,13 +175,6 @@ def run_experiment(cfg: dict, data: dict, verbose: bool = True) -> dict:
     clip = cfg["clip_norm"]
 
     batch_gen = torch.Generator(device=device).manual_seed(cfg["seed"])        # thứ tự lô theo seed
-    sub_idx = torch.randperm(len(X_tr), generator=torch.Generator().manual_seed(0))[:TRAIN_LOSS_SUBSET]
-    X_sub, y_sub = X_tr[sub_idx.to(device)], y_tr[sub_idx.to(device)]
-
-    if on_cuda:
-        torch.cuda.synchronize()
-        mem_start = torch.cuda.memory_allocated()
-        torch.cuda.reset_peak_memory_stats()
 
     step0_loss = evaluate(model, X_val, y_val, cfg["loss"])["loss"]
 
@@ -187,6 +188,7 @@ def run_experiment(cfg: dict, data: dict, verbose: bool = True) -> dict:
         model.train()
         if on_cuda:
             torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()        # đo đỉnh bộ nhớ của riêng phần huấn luyện
         t0 = time.perf_counter()
         gn_sum = torch.zeros((), device=device)
         gn_max = torch.zeros((), device=device)
@@ -229,6 +231,7 @@ def run_experiment(cfg: dict, data: dict, verbose: bool = True) -> dict:
 
         if on_cuda:
             torch.cuda.synchronize()
+            train_peak = max(train_peak, torch.cuda.max_memory_allocated())
         epoch_time = time.perf_counter() - t0
 
         if bool(bad):
@@ -265,7 +268,7 @@ def run_experiment(cfg: dict, data: dict, verbose: bool = True) -> dict:
                   f"acc {va['acc']:.4f} f1 {va['macro_f1']:.4f} | gn {history['grad_norm'][-1]:.3f} "
                   f"(max {history['grad_norm_max'][-1]:.2f}) | {epoch_time:.1f}s")
 
-    peak_mem = (torch.cuda.max_memory_allocated() - mem_start) / 2**20 if on_cuda else None
+    peak_mem = (train_peak - mem_start) / 2**20 if on_cuda and train_peak else None
     have = len(history["epoch"]) > 0
     b = best_epoch - 1 if best_epoch is not None else None
     summary = dict(
